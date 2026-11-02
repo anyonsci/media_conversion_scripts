@@ -17,15 +17,20 @@ const { exec } = require('child_process');
 const util = require('util');
 const { logger } = require('../lib/logger');
 const { scanFiles } = require('../lib/scanner');
+const { detectImageFormat } = require('../lib/image_utils');
 
 const execPromise = util.promisify(exec);
 
 /**
  * Decodes an image file to high-quality thumbnail (320px) and preview (1600px).
- * Uses avifdec for .avif files to ensure full tile-grid assembly.
+ * Uses avifdec for .avif files to ensure full tile-grid assembly,
+ * heif-convert for HEIC/HEIF files with ffmpeg fallback,
+ * and ffmpeg with -vframes 1 for JPEG/PNG/WebP.
  */
 async function generateThumbnailAndPreview(inputPath, thumbOutPath, prevOutPath, tempDir) {
-  const isAvif = inputPath.toLowerCase().endsWith('.avif');
+  const format = detectImageFormat(inputPath);
+  const isAvif = format === 'avif' || inputPath.toLowerCase().endsWith('.avif');
+  const isHeic = format === 'heic';
   let sourceForScaling = inputPath;
   let intermediateJpg = null;
 
@@ -35,32 +40,56 @@ async function generateThumbnailAndPreview(inputPath, thumbOutPath, prevOutPath,
       // Step 1: Decode complete AVIF tile grid via avifdec (single-threaded to prevent thrashing)
       await execPromise(`avifdec -j 1 -q 95 "${inputPath}" "${intermediateJpg}"`);
       sourceForScaling = intermediateJpg;
+    } else if (isHeic) {
+      intermediateJpg = path.join(tempDir, `full_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
+      try {
+        await execPromise(`heif-convert --codec-threads 1 -q 95 "${inputPath}" "${intermediateJpg}"`);
+        sourceForScaling = intermediateJpg;
+      } catch (heifErr) {
+        // Fallback to ffmpeg directly on inputPath
+        sourceForScaling = inputPath;
+      }
     }
 
     // Step 2: Downscale to high-quality thumbnail (320px) and preview (1600px)
+    // Note: -vframes 1 ensures multi-picture JPEGs (e.g. Ultra HDR / Apple HDR gain maps) don't overwrite primary frame
     const cmd = [
       'ffmpeg',
       '-threads', '1',
       '-y',
       '-v', 'error',
       '-i', `"${sourceForScaling}"`,
+      '-vframes', '1',
       '-vf', '"scale=320:320:force_original_aspect_ratio=decrease"',
       '-q:v', '2',
       '-update', '1',
       `"${thumbOutPath}"`,
+      '-vframes', '1',
       '-vf', '"scale=\'min(1600,iw)\':\'min(1600,ih)\':force_original_aspect_ratio=decrease"',
       '-q:v', '4',
       '-update', '1',
       `"${prevOutPath}"`,
     ].join(' ');
 
-    await execPromise(cmd);
+    try {
+      await execPromise(cmd);
+    } catch (ffmpegErr) {
+      // If primary ffmpeg failed on non-AVIF and non-HEIC, try heif-convert as secondary fallback
+      if (!isAvif && !isHeic) {
+        intermediateJpg = path.join(tempDir, `full_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
+        await execPromise(`heif-convert --codec-threads 1 -q 95 "${inputPath}" "${intermediateJpg}"`);
+        const fallbackCmd = cmd.replace(`"${sourceForScaling}"`, `"${intermediateJpg}"`);
+        await execPromise(fallbackCmd);
+      } else {
+        throw ffmpegErr;
+      }
+    }
 
     // Guardrail: Ensure preview fits within MEGA's 1MB attribute ceiling (<800KB safe)
     if (fs.existsSync(prevOutPath) && fs.statSync(prevOutPath).size > 800000) {
       const cmpPath = prevOutPath + '.cmp.jpg';
       try {
-        await execPromise(`ffmpeg -threads 1 -y -v error -i "${prevOutPath}" -q:v 6 "${cmpPath}"`);
+        await execPromise(`ffmpeg -threads 1 -y -v error -i "${prevOutPath}" -vframes 1 -q:v 6 "${cmpPath}"`);
         if (fs.existsSync(cmpPath) && fs.statSync(cmpPath).size < fs.statSync(prevOutPath).size) {
           fs.renameSync(cmpPath, prevOutPath);
         } else if (fs.existsSync(cmpPath)) {
@@ -81,7 +110,9 @@ async function generateThumbnailAndPreview(inputPath, thumbOutPath, prevOutPath,
  * Generates thumbnail ONLY (320px, full-frame).
  */
 async function generateThumbnailOnly(inputPath, thumbOutPath, tempDir) {
-  const isAvif = inputPath.toLowerCase().endsWith('.avif');
+  const format = detectImageFormat(inputPath);
+  const isAvif = format === 'avif' || inputPath.toLowerCase().endsWith('.avif');
+  const isHeic = format === 'heic';
   let sourceForScaling = inputPath;
   let intermediateJpg = null;
 
@@ -90,6 +121,14 @@ async function generateThumbnailOnly(inputPath, thumbOutPath, tempDir) {
       intermediateJpg = path.join(tempDir, `full_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
       await execPromise(`avifdec -j 1 -q 95 "${inputPath}" "${intermediateJpg}"`);
       sourceForScaling = intermediateJpg;
+    } else if (isHeic) {
+      intermediateJpg = path.join(tempDir, `full_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
+      try {
+        await execPromise(`heif-convert --codec-threads 1 -q 95 "${inputPath}" "${intermediateJpg}"`);
+        sourceForScaling = intermediateJpg;
+      } catch (heifErr) {
+        sourceForScaling = inputPath;
+      }
     }
 
     const cmd = [
@@ -98,13 +137,25 @@ async function generateThumbnailOnly(inputPath, thumbOutPath, tempDir) {
       '-y',
       '-v', 'error',
       '-i', `"${sourceForScaling}"`,
+      '-vframes', '1',
       '-vf', '"scale=320:320:force_original_aspect_ratio=decrease"',
       '-q:v', '2',
       '-update', '1',
       `"${thumbOutPath}"`,
     ].join(' ');
 
-    await execPromise(cmd);
+    try {
+      await execPromise(cmd);
+    } catch (ffmpegErr) {
+      if (!isAvif && !isHeic) {
+        intermediateJpg = path.join(tempDir, `full_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
+        await execPromise(`heif-convert --codec-threads 1 -q 95 "${inputPath}" "${intermediateJpg}"`);
+        const fallbackCmd = cmd.replace(`"${sourceForScaling}"`, `"${intermediateJpg}"`);
+        await execPromise(fallbackCmd);
+      } else {
+        throw ffmpegErr;
+      }
+    }
   } finally {
     if (intermediateJpg && fs.existsSync(intermediateJpg)) {
       try {

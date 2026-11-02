@@ -17,6 +17,12 @@ const util = require('util');
 const cron = require('node-cron');
 const { logger, formatBytes } = require('../lib/logger');
 const { scanFiles } = require('../lib/scanner');
+const {
+  detectImageFormat,
+  isUltraHdr,
+  getJpegDimensions,
+  ULTRA_HDR_MARKERS,
+} = require('../lib/image_utils');
 
 const execPromise = util.promisify(exec);
 
@@ -54,53 +60,6 @@ function resolveHomePath(filePath) {
   return path.resolve(filePath);
 }
 
-/**
- * Markers indicative of an ISO 21496-1 / Adobe / Apple HDR gain map stream inside a JPEG container.
- */
-const ULTRA_HDR_MARKERS = [
-  Buffer.from('hdrgm:Version'),
-  Buffer.from('hdrgm:version'),
-  Buffer.from('http://ns.adobe.com/hdr-gain-map/'),
-  Buffer.from('HDRGainMapVersion'),
-  Buffer.from('HDRGainMap:HDRGainMapVersion'),
-  Buffer.from('http://ns.apple.com/HDRGainMap/'),
-];
-
-/**
- * Fast inspection to detect if a JPEG buffer contains an Ultra HDR gain map.
- * @param {Buffer} buffer
- * @returns {boolean}
- */
-function isUltraHdr(buffer) {
-  if (!buffer || buffer.length < 100) return false;
-  const scanLimit = Math.min(buffer.length, 2 * 1024 * 1024);
-  const scanSlice = buffer.subarray(0, scanLimit);
-  return ULTRA_HDR_MARKERS.some((marker) => scanSlice.includes(marker));
-}
-
-/**
- * Fast inspection to extract width and height from a JPEG buffer without spawning child processes.
- * @param {Buffer} buffer
- * @returns {{ width: number, height: number } | null}
- */
-function getJpegDimensions(buffer) {
-  if (!buffer || buffer.length < 4 || buffer[0] !== 0xFF || buffer[1] !== 0xD8) return null;
-  let offset = 2;
-  while (offset < buffer.length - 8) {
-    if (buffer[offset] !== 0xFF) { offset++; continue; }
-    const marker = buffer[offset + 1];
-    if (marker === 0xC0 || marker === 0xC1 || marker === 0xC2) {
-      const height = buffer.readUInt16BE(offset + 5);
-      const width = buffer.readUInt16BE(offset + 7);
-      if (width > 0 && height > 0) return { width, height };
-    }
-    if (offset + 4 > buffer.length) break;
-    const len = buffer.readUInt16BE(offset + 2);
-    if (len < 2) break;
-    offset += 2 + len;
-  }
-  return null;
-}
 
 /**
  * Quickly validates that the converted AVIF is perceptually similar and structurally
@@ -379,6 +338,7 @@ async function processImage(item, config) {
   const tempAvifPath = tempJpgPath.replace(/\.(jpe?g|heic|heif)$/i, '.avif');
   const tempThumbPath = tempJpgPath + '.thumb.jpg';
   const tempPrevPath = tempJpgPath + '.prev.jpg';
+  const tempDecodedPath = tempJpgPath + '.raw.jpg';
 
   logger.info(`Starting conversion: "${relativePath}" (${formatBytes(file.size)})`);
 
@@ -468,25 +428,71 @@ async function processImage(item, config) {
     let thumbBuffer = null;
     let previewBuffer = null;
     try {
-      const isHeic = /\.(heic|heif)$/i.test(tempJpgPath);
-      if (isHeic) {
-        const tempDecodedPath = tempJpgPath + '.raw.jpg';
-        await execPromise(`heif-convert --codec-threads 1 -q 95 "${tempJpgPath}" "${tempDecodedPath}"`);
-        await execPromise(
-          `ffmpeg -threads 1 -y -v error -i "${tempDecodedPath}" \
-            -vf "scale=320:320:force_original_aspect_ratio=decrease" -q:v 2 -update 1 "${tempThumbPath}" \
-            -vf "scale='min(1600,iw)':'min(1600,ih)':force_original_aspect_ratio=decrease" -q:v 4 -update 1 "${tempPrevPath}"`
-        );
-        fs.promises.unlink(tempDecodedPath).catch(() => {});
-      } else {
-        await execPromise(
-          `ffmpeg -threads 1 -y -v error -i "${tempJpgPath}" \
-            -vf "scale=320:320:force_original_aspect_ratio=decrease" -q:v 2 -update 1 "${tempThumbPath}" \
-            -vf "scale='min(1600,iw)':'min(1600,ih)':force_original_aspect_ratio=decrease" -q:v 4 -update 1 "${tempPrevPath}"`
-        );
+      const format = detectImageFormat(jpgBuffer, tempJpgPath);
+      let decodedSuccessfully = false;
+
+      // Method A: If detected as HEIC container, try heif-convert first
+      if (format === 'heic') {
+        try {
+          await execPromise(`heif-convert --codec-threads 1 -q 95 "${tempJpgPath}" "${tempDecodedPath}"`);
+          await execPromise(
+            `ffmpeg -threads 1 -y -v error -i "${tempDecodedPath}" \
+              -vframes 1 -vf "scale=320:320:force_original_aspect_ratio=decrease" -q:v 2 -update 1 "${tempThumbPath}" \
+              -vframes 1 -vf "scale='min(1600,iw)':'min(1600,ih)':force_original_aspect_ratio=decrease" -q:v 4 -update 1 "${tempPrevPath}"`
+          );
+          decodedSuccessfully = fs.existsSync(tempThumbPath) && fs.existsSync(tempPrevPath);
+        } catch (heifErr) {
+          logger.warn(`heif-convert failed for "${fileName}" (${heifErr.message.trim()}). Attempting ffmpeg direct fallback...`);
+        }
       }
-      thumbBuffer = await fs.promises.readFile(tempThumbPath);
-      previewBuffer = await fs.promises.readFile(tempPrevPath);
+
+      // Method B: If not HEIC, or if heif-convert failed, try ffmpeg direct on source
+      if (!decodedSuccessfully) {
+        try {
+          await execPromise(
+            `ffmpeg -threads 1 -y -v error -i "${tempJpgPath}" \
+              -vframes 1 -vf "scale=320:320:force_original_aspect_ratio=decrease" -q:v 2 -update 1 "${tempThumbPath}" \
+              -vframes 1 -vf "scale='min(1600,iw)':'min(1600,ih)':force_original_aspect_ratio=decrease" -q:v 4 -update 1 "${tempPrevPath}"`
+          );
+          decodedSuccessfully = fs.existsSync(tempThumbPath) && fs.existsSync(tempPrevPath);
+        } catch (ffmpegErr) {
+          if (format !== 'heic') {
+            // If primary ffmpeg failed on non-HEIC, try heif-convert as secondary fallback
+            try {
+              await execPromise(`heif-convert --codec-threads 1 -q 95 "${tempJpgPath}" "${tempDecodedPath}"`);
+              await execPromise(
+                `ffmpeg -threads 1 -y -v error -i "${tempDecodedPath}" \
+                  -vframes 1 -vf "scale=320:320:force_original_aspect_ratio=decrease" -q:v 2 -update 1 "${tempThumbPath}" \
+                  -vframes 1 -vf "scale='min(1600,iw)':'min(1600,ih)':force_original_aspect_ratio=decrease" -q:v 4 -update 1 "${tempPrevPath}"`
+              );
+              decodedSuccessfully = fs.existsSync(tempThumbPath) && fs.existsSync(tempPrevPath);
+            } catch (_) {}
+          }
+        }
+      }
+
+      // Method C: Ultimate fallback - decode from converted AVIF if source decoders failed
+      if (!decodedSuccessfully && fs.existsSync(tempAvifPath)) {
+        try {
+          logger.warn(`Source decoders failed for "${fileName}". Falling back to extracting thumbnail/preview from converted AVIF...`);
+          await execPromise(`avifdec -j 1 -q 95 "${tempAvifPath}" "${tempDecodedPath}"`);
+          await execPromise(
+            `ffmpeg -threads 1 -y -v error -i "${tempDecodedPath}" \
+              -vframes 1 -vf "scale=320:320:force_original_aspect_ratio=decrease" -q:v 2 -update 1 "${tempThumbPath}" \
+              -vframes 1 -vf "scale='min(1600,iw)':'min(1600,ih)':force_original_aspect_ratio=decrease" -q:v 4 -update 1 "${tempPrevPath}"`
+          );
+          decodedSuccessfully = fs.existsSync(tempThumbPath) && fs.existsSync(tempPrevPath);
+        } catch (avifDecErr) {
+          logger.warn(`AVIF fallback thumbnail extraction also failed: ${avifDecErr.message.trim()}`);
+        }
+      }
+
+      if (fs.existsSync(tempThumbPath)) {
+        thumbBuffer = await fs.promises.readFile(tempThumbPath);
+      }
+      if (fs.existsSync(tempPrevPath)) {
+        previewBuffer = await fs.promises.readFile(tempPrevPath);
+      }
 
       // Guardrail: MEGA file attributes have a strict 1MB (1,048,576 bytes) limit.
       // High-frequency/complex images at 1600px can exceed 1MB, triggering HTTP 400 Bad Request.
@@ -494,7 +500,7 @@ async function processImage(item, config) {
       if (previewBuffer && previewBuffer.length > 800000) {
         const tempPrevCompressed = tempPrevPath + '.cmp.jpg';
         try {
-          await execPromise(`ffmpeg -threads 1 -y -v error -i "${tempPrevPath}" -q:v 6 "${tempPrevCompressed}"`);
+          await execPromise(`ffmpeg -threads 1 -y -v error -i "${tempPrevPath}" -vframes 1 -q:v 6 "${tempPrevCompressed}"`);
           const compressedBuf = await fs.promises.readFile(tempPrevCompressed);
           if (compressedBuf.length > 0 && compressedBuf.length < previewBuffer.length) {
             previewBuffer = compressedBuf;
@@ -508,6 +514,10 @@ async function processImage(item, config) {
       }
     } catch (thumbErr) {
       logger.warn(`Could not generate thumbnail/preview during upload: ${thumbErr.message}`);
+    } finally {
+      if (fs.existsSync(tempDecodedPath)) {
+        await fs.promises.unlink(tempDecodedPath).catch(() => {});
+      }
     }
 
     // Step 5: Quick Validation (Perceptual similarity, decoding integrity, dimension match)
@@ -552,6 +562,9 @@ async function processImage(item, config) {
       if (fs.existsSync(tempAvifPath)) await fs.promises.unlink(tempAvifPath);
       if (fs.existsSync(tempThumbPath)) await fs.promises.unlink(tempThumbPath);
       if (fs.existsSync(tempPrevPath)) await fs.promises.unlink(tempPrevPath);
+      if (fs.existsSync(tempDecodedPath)) await fs.promises.unlink(tempDecodedPath);
+      const tempPrevCompressed = tempPrevPath + '.cmp.jpg';
+      if (fs.existsSync(tempPrevCompressed)) await fs.promises.unlink(tempPrevCompressed);
     } catch (_) {}
   }
 }

@@ -343,4 +343,75 @@ assert.strictEqual(parsed3.preset, 8, 'default preset should remain 8');
 
 console.log('✔ Test 13 passed: CLI argument parsing for preset (-p), path, and threads');
 
+// Test 14: Image format detection via magic bytes vs file extensions
+const { detectImageFormat, isUltraHdr, getJpegDimensions } = require('./lib/image_utils');
+
+// Mock JPEG header with .HEIC extension (simulates iPhone JPEG exported with .HEIC suffix)
+const jpegHeaderWithHeicExt = Buffer.from([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01]);
+assert.strictEqual(
+  detectImageFormat(jpegHeaderWithHeicExt, 'IMG_3114.HEIC'),
+  'jpeg',
+  'JPEG magic bytes must be detected as jpeg regardless of .HEIC extension'
+);
+
+// Mock true HEIC header (ftypheic)
+const heicHeader = Buffer.concat([
+  Buffer.from([0x00, 0x00, 0x00, 0x1C]),
+  Buffer.from('ftypheic', 'ascii'),
+  Buffer.alloc(16),
+]);
+assert.strictEqual(
+  detectImageFormat(heicHeader, 'photo.jpg'),
+  'heic',
+  'HEIC magic bytes must be detected as heic regardless of .jpg extension'
+);
+
+// Mock AVIF header (ftypavif)
+const avifHeader = Buffer.concat([
+  Buffer.from([0x00, 0x00, 0x00, 0x24]),
+  Buffer.from('ftypavif', 'ascii'),
+  Buffer.alloc(16),
+]);
+assert.strictEqual(
+  detectImageFormat(avifHeader, 'image.bin'),
+  'avif',
+  'AVIF ftyp brand must be detected as avif'
+);
+
+// Mock PNG and WebP
+const pngHeader = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+assert.strictEqual(detectImageFormat(pngHeader), 'png', 'PNG magic bytes must be detected as png');
+
+const webpHeader = Buffer.concat([
+  Buffer.from('RIFF', 'ascii'),
+  Buffer.from([0x00, 0x00, 0x00, 0x00]),
+  Buffer.from('WEBP', 'ascii'),
+]);
+assert.strictEqual(detectImageFormat(webpHeader), 'webp', 'WebP RIFF header must be detected as webp');
+
+// Extension fallback when buffer is empty or unknown
+assert.strictEqual(detectImageFormat(Buffer.alloc(10), 'test.jpg'), 'jpeg', 'Fallback to .jpg extension');
+assert.strictEqual(detectImageFormat(Buffer.alloc(10), 'test.heic'), 'heic', 'Fallback to .heic extension');
+assert.strictEqual(detectImageFormat(Buffer.alloc(10), 'test.avif'), 'avif', 'Fallback to .avif extension');
+
+console.log('✔ Test 14 passed: Image container format detection via magic bytes & extension fallback');
+
+// Test 15: Ultra HDR marker detection & JPEG dimension parsing
+const sdrJpeg = Buffer.from([0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x04, 0x00, 0x03, 0x00]); // 768x1024
+assert.strictEqual(isUltraHdr(sdrJpeg), false, 'Plain SDR JPEG should not be identified as Ultra HDR');
+
+const hdrJpeg = Buffer.concat([
+  sdrJpeg,
+  Buffer.alloc(100),
+  Buffer.from('...http://ns.adobe.com/hdr-gain-map/...', 'utf8'),
+]);
+assert.strictEqual(isUltraHdr(hdrJpeg), true, 'JPEG with HDR gain map marker must be identified as Ultra HDR');
+
+const dims = getJpegDimensions(sdrJpeg);
+assert.ok(dims !== null, 'Dimensions must be parsed from SOF marker');
+assert.strictEqual(dims.height, 1024);
+assert.strictEqual(dims.width, 768);
+
+console.log('✔ Test 15 passed: Ultra HDR gain map detection & JPEG dimension extraction');
+
 console.log('\nAll unit tests passed successfully!');
